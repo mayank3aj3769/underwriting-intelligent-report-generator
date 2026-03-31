@@ -116,17 +116,14 @@ async def generate_queries(state: PipelineState) -> dict:
         f"  Incorporated: {meta.get('date_of_creation', 'unknown')}\n"
         f"  SIC activities: {', '.join(sic_labels) if sic_labels else 'not listed'}\n"
         f"  Insolvency history: {meta.get('has_insolvency_history', 'unknown')}\n\n"
-        "Generate 8–10 targeted Google search queries that will surface:\n"
-        "1. What the business does, its products/services, and revenue model\n"
+        "Generate exactly 5 targeted Google search queries that will surface:\n"
+        "1. Business model, products/services, and revenue model\n"
         "2. Key competitors and market position\n"
-        "3. Customer reviews and satisfaction (e.g. Trustpilot, G2)\n"
-        "4. Recent news, funding rounds, or regulatory actions\n"
-        "5. Financial performance indicators\n"
-        "6. Industry / sectoral outlook and market trends\n"
-        "7. Business risks, controversies, or legal issues\n"
-        "8. Key partnerships, clients, or growth signals\n\n"
-        "Return a JSON object: {\"queries\": [\"query1\", \"query2\", ...]}\n"
-        "Each query should be specific and phrased for Google."
+        "3. Customer reviews and reputation (Trustpilot, G2, press)\n"
+        "4. Recent news, funding, or regulatory actions\n"
+        "5. Industry outlook and sectoral trends\n\n"
+        "Return a JSON object: {\"queries\": [\"query1\", ..., \"query5\"]}\n"
+        "Each query should be specific, phrased for Google, and maximise coverage across these 5 areas."
     )
 
     try:
@@ -146,7 +143,7 @@ async def generate_queries(state: PipelineState) -> dict:
             response_format={"type": "json_object"},
         )
         data = json.loads(resp.choices[0].message.content or "{}")
-        queries: list[str] = data.get("queries", [])
+        queries: list[str] = data.get("queries", [])[:5]
     except Exception as e:
         errors.append(f"LLM query generation failed: {e}")
         queries = []
@@ -160,33 +157,46 @@ async def generate_queries(state: PipelineState) -> dict:
 # =====================================================================
 
 async def execute_searches(state: PipelineState) -> dict:
-    """Run every LLM-generated query through SerpAPI (web + news)."""
+    """Run all LLM-generated queries through SerpAPI in parallel."""
+    import asyncio
+
     client = SerpAPIClient()
     all_results: list[dict] = []
     errors: list[str] = []
+    queries = state.get("search_queries", [])
+    company_name = state["company_name"]
 
-    for query in state.get("search_queries", []):
+    async def _web_search(query: str) -> tuple[str, list[dict] | Exception]:
         try:
             hits = await client.search(query, num=5)
             for h in hits:
                 h["query"] = query
-            all_results.extend(hits)
-            logger.info("SerpAPI web: '%s' → %d results", query, len(hits))
+            return query, hits
         except Exception as e:
-            errors.append(f"SerpAPI web search failed for '{query}': {e}")
-            logger.warning("SerpAPI web failed for '%s': %s", query, e)
+            return query, e
 
-    company_name = state["company_name"]
-    try:
-        news = await client.search_news(f"{company_name} latest news", num=8)
-        for n in news:
-            n["query"] = f"{company_name} latest news"
-        all_results.extend(news)
-        logger.info("SerpAPI news: %d results", len(news))
-    except Exception as e:
-        errors.append(f"SerpAPI news search failed: {e}")
+    async def _news_search() -> tuple[str, list[dict] | Exception]:
+        q = f"{company_name} latest news"
+        try:
+            hits = await client.search_news(q, num=8)
+            for h in hits:
+                h["query"] = q
+            return q, hits
+        except Exception as e:
+            return q, e
 
-    logger.info("Total search results collected: %d", len(all_results))
+    tasks = [_web_search(q) for q in queries] + [_news_search()]
+    results = await asyncio.gather(*tasks)
+
+    for query, outcome in results:
+        if isinstance(outcome, Exception):
+            errors.append(f"SerpAPI search failed for '{query}': {outcome}")
+            logger.warning("SerpAPI failed for '%s': %s", query, outcome)
+        else:
+            all_results.extend(outcome)
+            logger.info("SerpAPI: '%s' -> %d results", query, len(outcome))
+
+    logger.info("Total search results collected: %d (from %d parallel queries)", len(all_results), len(tasks))
     return {"search_results": all_results, "errors": errors}
 
 
