@@ -37,6 +37,21 @@ class BusinessModelSummary(BaseModel):
     revenue_model: Optional[str] = Field(
         None, description="How it generates revenue — subscription, transaction fees, etc."
     )
+    current_revenue: Optional[str] = Field(
+        None,
+        description=(
+            "Most recent publicly available revenue figure with year/period, "
+            "or explicit statement that revenue data is not publicly available"
+        ),
+    )
+    revenue_trend: Optional[str] = Field(
+        None,
+        description=(
+            "Revenue trajectory — growth/decline direction, rate, and time period "
+            "(e.g. '35% YoY growth in 2024'), or explicit statement that trend data "
+            "is not publicly available"
+        ),
+    )
     key_products_services: list[str] = Field(
         default_factory=list, description="Core product/service offerings"
     )
@@ -163,3 +178,16 @@ class UnderwritingReport(BaseModel):
     sectoral_outlook: Optional[str] = None
     raw_evidence_count: int = 0
     readable_report: Optional[str] = None
+
+    evidence_confidence_score: float = Field(
+        default=0.0,
+        description="Confidence score from the evidence sufficiency evaluation (0.0–1.0)",
+    )
+    evidence_iterations: int = Field(
+        default=1,
+        description="Number of evidence-gathering iterations the agent performed",
+    )
+    evidence_gaps_found: list[str] = Field(
+        default_factory=list,
+        description="Evidence gaps identified during sufficiency evaluation",
+    )

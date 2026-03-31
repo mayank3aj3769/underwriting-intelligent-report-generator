@@ -62,6 +62,8 @@ class Citation(BaseModel):
 class BusinessModelSummary(BaseModel):
     description: str
     revenue_model: Optional[str] = None
+    current_revenue: Optional[str] = None
+    revenue_trend: Optional[str] = None
     key_products_services: list[str] = Field(default_factory=list)
     customer_segments: list[str] = Field(default_factory=list)
     geographies: list[str] = Field(default_factory=list)
@@ -129,6 +131,9 @@ class UnderwritingReport(BaseModel):
     sectoral_outlook: Optional[str] = None
     raw_evidence_count: int = 0
     readable_report: Optional[str] = None
+    evidence_confidence_score: float = 0.0
+    evidence_iterations: int = 1
+    evidence_gaps_found: list[str] = Field(default_factory=list)
 
 
 class CandidateCompany(BaseModel):
@@ -150,20 +155,24 @@ def get_generator() -> ReportGenerator:
 
 
 def run_async(coro):
-    """Bridge async pipeline calls into synchronous Streamlit context."""
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
+    """Bridge async pipeline calls into synchronous Streamlit context.
+
+    Uses asyncio.run() which properly shuts down async generators and
+    the default executor before closing the loop, preventing
+    'Event loop is closed' errors from httpx/OpenAI client cleanup.
+    """
+    return asyncio.run(coro)
 
 
 # ── Direct pipeline calls (no HTTP) ──
 
 
-def generate_report(identifier: str) -> ReportGenerationResult:
+def generate_report(
+    identifier: str,
+    report_context: dict | None = None,
+) -> ReportGenerationResult:
     gen = get_generator()
-    return run_async(gen.generate(identifier))
+    return run_async(gen.generate(identifier, report_context=report_context))
 
 
 def generate_report_by_number(company_number: str) -> ReportGenerationResult:
@@ -177,15 +186,32 @@ def generate_report_by_number(company_number: str) -> ReportGenerationResult:
 def render_report(report: UnderwritingReport):
     st.markdown(f"### {report.company_name}")
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("Company Number", report.company_number)
     col2.metric("Evidence Items", report.raw_evidence_count)
     col3.metric("Confidence", report.quality_signals.confidence.value.title())
+    col4.metric(
+        "Evidence Score",
+        f"{report.evidence_confidence_score:.0%}",
+    )
 
     st.caption(
         f"Generated: {report.report_generated_at}  |  "
         f"Sources: {', '.join(report.sources_used)}"
     )
+
+    if report.evidence_iterations > 1:
+        st.info(
+            f"**Adaptive agent:** Additional data gathering was triggered "
+            f"due to insufficient evidence. The agent ran "
+            f"**{report.evidence_iterations} evidence-gathering iterations** "
+            f"to improve report quality."
+        )
+    if report.evidence_gaps_found:
+        st.warning(
+            f"**Evidence gaps detected:** {', '.join(report.evidence_gaps_found)}. "
+            f"The agent generated targeted queries to fill these gaps."
+        )
 
     st.divider()
 
@@ -195,6 +221,10 @@ def render_report(report: UnderwritingReport):
     st.write(report.business_model.description)
     if report.business_model.revenue_model:
         st.markdown(f"**Revenue Model:** {report.business_model.revenue_model}")
+    if report.business_model.current_revenue:
+        st.markdown(f"**Current Revenue:** {report.business_model.current_revenue}")
+    if report.business_model.revenue_trend:
+        st.markdown(f"**Revenue Trend:** {report.business_model.revenue_trend}")
     if report.business_model.key_products_services:
         st.markdown(
             f"**Key Products/Services:** "
@@ -341,6 +371,13 @@ def render_report(report: UnderwritingReport):
                 else:
                     st.markdown(f"- {label} *({cit.source})*")
 
+    st.divider()
+    st.markdown(
+        ":speech_balloon: **You can now ask follow-up questions** about this report. "
+        "For example: *\"Tell me more about their competitors\"*, "
+        "*\"What are the main risks?\"*, or *\"Are there any recent funding rounds?\"*"
+    )
+
 
 def render_disambiguation(candidates: list[CandidateCompany], query: str):
     st.markdown(
@@ -381,6 +418,8 @@ def init_session():
         st.session_state.pending_number = None
     if "pending_query" not in st.session_state:
         st.session_state.pending_query = None
+    if "report_context" not in st.session_state:
+        st.session_state.report_context = None
 
 
 def main():
@@ -410,9 +449,10 @@ def main():
         )
         if keys_ok:
             st.markdown("System: :green[ready]")
-            st.markdown("Pipeline: `langgraph`")
+            st.markdown("Pipeline: `langgraph` (adaptive)")
             st.markdown("Search: `serpapi`")
             st.markdown("Synthesis: `openai`")
+            st.markdown("Evidence loop: :green[enabled]")
         else:
             missing = []
             if not settings.has_companies_house_key:
@@ -426,6 +466,18 @@ def main():
                 st.markdown(f"- `{k}`")
 
         st.divider()
+
+        if st.session_state.report_context:
+            ctx = st.session_state.report_context
+            st.markdown("### Active Report")
+            st.markdown(f"**{ctx['company_name']}**")
+            st.markdown(f"`{ctx['company_number']}`")
+            st.caption("Ask follow-up questions or enter a new company to start fresh.")
+            if st.button("Clear report context", key="clear_ctx"):
+                st.session_state.report_context = None
+                st.rerun()
+            st.divider()
+
         st.markdown("### Quick Examples")
         examples = [
             ("REVOLUT LTD", "Exact name"),
@@ -450,6 +502,10 @@ def main():
             elif msg.get("type") == "disambiguation" and msg.get("candidates"):
                 candidates = [CandidateCompany(**c) for c in msg["candidates"]]
                 render_disambiguation(candidates, msg.get("query", ""))
+            elif msg.get("type") == "follow_up":
+                if msg.get("used_web_search"):
+                    st.caption(f"Searched the web: *{msg.get('search_query', '')}*")
+                st.markdown(msg["content"])
             else:
                 st.markdown(msg["content"])
 
@@ -468,7 +524,13 @@ def main():
         st.rerun()
 
     # Chat input
-    if prompt := st.chat_input("Enter company name or number..."):
+    placeholder = (
+        f"Ask a follow-up about {st.session_state.report_context['company_name']}, "
+        "or enter a new company..."
+        if st.session_state.report_context
+        else "Enter company name or number..."
+    )
+    if prompt := st.chat_input(placeholder):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
@@ -476,16 +538,45 @@ def main():
 
 
 def _handle_query(query: str):
-    """Process a user query by calling the pipeline directly."""
+    """Process a user query — classify intent, then route to report gen or follow-up."""
+    report_context = st.session_state.report_context
+
     with st.chat_message("assistant"):
-        with st.spinner("Generating intelligence report... this may take up to 2 minutes."):
+        spinner_text = (
+            "Thinking about your question..."
+            if report_context
+            else "Analysing your request..."
+        )
+        with st.spinner(spinner_text):
             try:
-                result = generate_report(query)
+                result = generate_report(query, report_context=report_context)
             except Exception as e:
                 msg = f"Pipeline error: {e}"
                 st.error(msg)
                 st.session_state.messages.append({"role": "assistant", "content": msg})
                 return
+
+        if result.is_follow_up:
+            fu = result.follow_up
+            if fu.used_web_search:
+                st.caption(f"Searched the web: *{fu.search_query}*")
+            st.markdown(fu.answer)
+            st.session_state.messages.append({
+                "role": "assistant",
+                "type": "follow_up",
+                "content": fu.answer,
+                "used_web_search": fu.used_web_search,
+                "search_query": fu.search_query,
+            })
+            return
+
+        if result.is_rejected:
+            st.markdown(result.rejection)
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": result.rejection,
+            })
+            return
 
         if result.needs_disambiguation and result.disambiguation:
             candidates = []
@@ -524,6 +615,14 @@ def _handle_query(query: str):
                 return
 
             render_report(report)
+
+            st.session_state.report_context = {
+                "company_name": report.company_name,
+                "company_number": report.company_number,
+                "readable_report": report.readable_report or "",
+                "report_data": report_data,
+            }
+
             st.session_state.messages.append({
                 "role": "assistant",
                 "type": "report",
@@ -554,6 +653,14 @@ def _generate_by_number(company_number: str):
             try:
                 report_data = result.report.model_dump()
                 report = UnderwritingReport(**report_data)
+
+                st.session_state.report_context = {
+                    "company_name": report.company_name,
+                    "company_number": report.company_number,
+                    "readable_report": report.readable_report or "",
+                    "report_data": report_data,
+                }
+
                 st.session_state.messages.append({
                     "role": "assistant",
                     "type": "report",

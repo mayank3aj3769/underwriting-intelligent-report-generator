@@ -75,7 +75,7 @@ The FastAPI backend (`main.py`) and HTTP-based frontend (`streamlit_app.py`) rem
 
 ## Pipeline Architecture
 
-The pipeline is a linear LangGraph `StateGraph` with 5 nodes. Each node receives the full `PipelineState` and returns a partial state update dict.
+The pipeline is an adaptive LangGraph `StateGraph` with 7 nodes and a conditional feedback loop. After summarisation, the agent evaluates whether the collected evidence is sufficient. If not, it generates targeted gap-filling queries, re-searches, re-summarises, and re-evaluates (up to 2 iterations). Each node receives the full `PipelineState` and returns a partial state update dict.
 
 ```
                                 External Service
@@ -96,9 +96,9 @@ The pipeline is a linear LangGraph `StateGraph` with 5 nodes. Each node receives
            ▼
 ┌──────────────────────┐
 │ 3. execute_searches  │ ──►    SerpAPI Google Search + News
-│    (parallel)        │        5 web queries + 1 news query
-│                      │        ALL executed concurrently via asyncio.gather
-│                      │        Returns snippets, Knowledge Graph, news
+│    (parallel)        │        5 web queries + 1 news query (iter 0)
+│                      │        Gap queries only (iter 1+)
+│                      │        Merges & deduplicates across iterations
 └──────────┬───────────┘
            │ search_results: list[dict]
            ▼
@@ -111,11 +111,53 @@ The pipeline is a linear LangGraph `StateGraph` with 5 nodes. Each node receives
            │ search_summary: str
            ▼
 ┌──────────────────────┐
-│ 5. synthesize_report │ ──►    OpenAI GPT (temp=0.2, JSON mode)
+│ 5. evaluate_         │        Analyses evidence coverage:
+│    sufficiency       │        - Source count, section coverage
+│                      │        - Competitor/review/news presence
+│                      │        Returns confidence_score, missing_sections
+└──────────┬───────────┘
+           │
+     ┌─────┴─────┐
+     │ sufficient │
+     │  enough?   │
+     └─────┬─────┘
+      YES  │   NO (and iteration < 2)
+      │    │
+      │    ▼
+      │   ┌──────────────────────┐
+      │   │ 6. generate_gap_     │ ──►  OpenAI GPT (temp=0.4, JSON mode)
+      │   │    queries           │      Targeted queries for missing
+      │   │                      │      sections ONLY
+      │   └──────────┬───────────┘
+      │              │ loops back to execute_searches (step 3)
+      │              ▼
+      │         (re-search → re-summarise → re-evaluate)
+      │
+      ▼
+┌──────────────────────┐
+│ 7. synthesize_report │ ──►    OpenAI GPT (temp=0.2, JSON mode)
 │                      │        Final UnderwritingReport JSON
 │                      │        Merges CH filing + search briefing
 └──────────────────────┘
 ```
+
+### Evidence Sufficiency Loop
+
+The `evaluate_sufficiency` node analyses five coverage dimensions:
+
+| Dimension | Detection heuristic |
+|---|---|
+| Business model | Keywords: revenue, business model, product, service, customer |
+| Competition | Keywords: competitor, rival, market share, competes with |
+| Quality signals | Keywords: trustpilot, review, rating, g2.com, glassdoor |
+| News | Result type `news` or keywords: announced, funding, raised |
+| Financial/regulatory | Keywords: FCA, insolvency, regulatory, compliance, fine |
+
+**Confidence score** (0.0–1.0) = 0.3 × source score + 0.5 × coverage score + 0.2 × summary score
+
+**Sufficiency threshold:** confidence ≥ 0.6 AND sources ≥ 8 AND ≥ 3/5 sections covered.
+
+If insufficient, `generate_gap_queries` uses the LLM to produce targeted queries for ONLY the missing sections. The loop runs at most 2 iterations to bound latency and API costs.
 
 ### Latency Optimisations
 
@@ -124,6 +166,7 @@ The pipeline is a linear LangGraph `StateGraph` with 5 nodes. Each node receives
 | **Parallel SerpAPI execution** — all 6 queries (5 web + 1 news) run concurrently via `asyncio.gather` | ~30-35s saved vs sequential |
 | **Reduced query count** — LLM generates 5 focused queries (hard-capped) instead of 8-10 | ~10-15s saved on search + summarisation |
 | **Single-process deployment** — `app.py` calls pipeline directly, no HTTP round-trip to FastAPI | ~1-2s saved per request |
+| **Bounded sufficiency loop** — max 2 iterations prevents runaway API usage | Adds ~30-60s only when evidence is weak |
 
 ## State Schema
 
@@ -133,11 +176,31 @@ class PipelineState(TypedDict):
     company_name: str                            # Input
     company_profile_text: str                    # Node 1: formatted CH profile
     company_metadata: dict                       # Node 1: structured metadata
-    search_queries: list[str]                    # Node 2: LLM-generated queries (max 5)
-    search_results: list[dict]                   # Node 3: normalised SerpAPI results
+    search_queries: list[str]                    # Node 2/6: LLM-generated queries (max 5)
+    search_results: list[dict]                   # Node 3: normalised SerpAPI results (merged across iterations)
     search_summary: str                          # Node 4: LLM briefing with citations
-    final_report: dict                           # Node 5: serialised UnderwritingReport
+    evidence_metrics: EvidenceMetrics            # Node 5: sufficiency analysis results
+    iteration_count: int                         # Node 5: evidence-gathering iteration counter
+    sufficiency_flag: bool                       # Node 5: whether evidence is sufficient
+    final_report: dict                           # Node 7: serialised UnderwritingReport
     errors: Annotated[list[str], operator.add]   # Accumulated across all nodes
+```
+
+### EvidenceMetrics
+
+```python
+class EvidenceMetrics(TypedDict, total=False):
+    total_sources: int
+    has_business_info: bool
+    has_competitors: bool
+    has_reviews: bool
+    has_news: bool
+    has_financial_signals: bool
+    section_coverage: dict[str, bool]
+    confidence_score: float           # 0.0–1.0 weighted score
+    missing_sections: list[str]       # sections needing more data
+    is_sufficient: bool
+    reasoning: str                    # human-readable explanation
 ```
 
 ## Report Schema
@@ -234,7 +297,7 @@ The LLM generates exactly 5 queries (hard-capped with `[:5]`), each targeting a 
 
 ### LangGraph over custom agent loop
 
-The explicit `StateGraph` provides a typed state contract (`PipelineState`), per-node inspectable I/O, automatic error accumulation via `Annotated[list[str], operator.add]`, and trivial extensibility (add a node + an edge).
+The explicit `StateGraph` provides a typed state contract (`PipelineState`), per-node inspectable I/O, automatic error accumulation via `Annotated[list[str], operator.add]`, and trivial extensibility (add a node + an edge). The conditional edge from `evaluate_sufficiency` demonstrates how LangGraph supports adaptive, non-linear pipelines while keeping the graph inspectable.
 
 ### Separate summariser node
 
@@ -263,10 +326,11 @@ Each quality signal carries a `strength` field (strong/moderate/weak) based on s
 ## Future Improvements
 
 1. **Caching** — Redis or in-memory cache for CH profiles (24h TTL) and search results (1h TTL)
-2. **Conditional graph edges** — Insolvency flag triggers a dedicated risk deep-dive node
+2. ~~**Conditional graph edges**~~ — ✅ Implemented: evidence sufficiency loop with conditional routing
 3. **FCA register integration** — Automated FCA authorisation check for financial services companies
 4. **Streaming responses** — Progressive report rendering as each node completes
 5. **Merge summarise + synthesise** — Single LLM call to further reduce latency
 6. **API authentication** — OAuth2 or API key auth on FastAPI endpoints
 7. **Rate limiting** — Per-user SerpAPI quota protection
 8. **Report persistence** — PostgreSQL storage with version comparison over time
+9. **LLM-based sufficiency evaluation** — Replace heuristic keyword matching with an LLM judge for richer gap detection

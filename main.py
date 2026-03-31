@@ -1,9 +1,11 @@
 """Underwriting Intelligence Report API.
 
 FastAPI application that generates structured underwriting intelligence
-reports for UK companies using a LangGraph agentic pipeline.
+reports for UK companies using an adaptive LangGraph agent pipeline.
 
-Pipeline: CH Fetch → LLM Query Gen → SerpAPI Search → LLM Summarise → LLM Report
+Pipeline: CH Fetch → Query Gen → Search → Summarise → Evaluate Sufficiency
+          ↳ (if insufficient) → Gap Queries → Re-search → Re-summarise → Re-evaluate
+          → Synthesise Report
 """
 
 import logging
@@ -78,6 +80,14 @@ class ReportByNumberRequest(BaseModel):
     )
 
 
+class FollowUpRequest(BaseModel):
+    question: str = Field(..., min_length=1, description="Follow-up question about the report")
+    report_context: dict = Field(
+        ...,
+        description="Report context containing company_name, company_number, and readable_report",
+    )
+
+
 # ---- Endpoints ----
 
 @app.get("/health")
@@ -139,6 +149,17 @@ async def generate_report_by_number(request: ReportByNumberRequest):
     return _format_result(result)
 
 
+@app.post("/api/v1/report/follow-up")
+async def follow_up_question(request: FollowUpRequest):
+    """Ask a follow-up question about a previously generated report."""
+    _require_all_keys()
+    result = await report_generator.generate(
+        request.question,
+        report_context=request.report_context,
+    )
+    return _format_result(result)
+
+
 def _require_all_keys() -> None:
     missing: list[str] = []
     if not settings.has_companies_house_key:
@@ -156,6 +177,8 @@ def _require_all_keys() -> None:
 
 def _format_result(result: ReportGenerationResult) -> dict:
     data = result.to_dict()
+    if result.is_rejected:
+        raise HTTPException(status_code=422, detail=data["message"])
     if result.is_error:
         raise HTTPException(status_code=404, detail=data["message"])
     return data

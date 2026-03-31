@@ -45,6 +45,10 @@ def generate_readable_report(report: UnderwritingReport) -> str:
     lines.append(f"**Generated:** {report.report_generated_at}")
     lines.append(f"**Sources Used:** {', '.join(report.sources_used)}")
     lines.append(f"**Evidence Items:** {report.raw_evidence_count}")
+    lines.append(f"**Evidence Confidence Score:** {report.evidence_confidence_score:.0%}")
+    lines.append(f"**Evidence Gathering Iterations:** {report.evidence_iterations}")
+    if report.evidence_gaps_found:
+        lines.append(f"**Evidence Gaps Addressed:** {', '.join(report.evidence_gaps_found)}")
     lines.append("")
 
     # ── A: Business Model ──
@@ -52,6 +56,10 @@ def generate_readable_report(report: UnderwritingReport) -> str:
     lines.append(report.business_model.description)
     if report.business_model.revenue_model:
         lines.append(f"\n**Revenue Model:** {report.business_model.revenue_model}")
+    if report.business_model.current_revenue:
+        lines.append(f"**Current Revenue:** {report.business_model.current_revenue}")
+    if report.business_model.revenue_trend:
+        lines.append(f"**Revenue Trend:** {report.business_model.revenue_trend}")
     if report.business_model.key_products_services:
         lines.append(
             f"**Key Products/Services:** "
