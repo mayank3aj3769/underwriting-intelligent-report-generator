@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+httpx
+python-dotenv
+pydantic
+openai
+google-search-results
+langgraph
+streamlit
