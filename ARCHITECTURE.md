@@ -18,13 +18,14 @@ No web scraping is performed. Every data point originates from a structured API 
 
 ```
 .
-├── main.py                    FastAPI application entry point
+├── app.py                     Streamlit standalone entrypoint (production)
+├── main.py                    FastAPI REST API entrypoint
 ├── config.py                  Environment variable loader (Settings singleton)
-├── cli.py                     CLI tool for report generation
-├── streamlit_app.py           Streamlit chat-based frontend
-├── Dockerfile                 Container image definition
+├── streamlit_app.py           Streamlit frontend (calls FastAPI over HTTP)
+├── Dockerfile                 Single-container image (runs app.py on port 8080)
 ├── requirements.txt           Python dependencies
 ├── .env.example               Environment variable template
+├── .streamlit/config.toml     Streamlit server configuration
 │
 ├── schemas/                   Pydantic data models
 │   ├── company.py             CompanyCandidate, CompanyProfile, Officer, CompanySearchResponse
@@ -50,6 +51,28 @@ No web scraping is performed. Every data point originates from a structured API 
     └── test_e2e.py            End-to-end integration tests (7 tests)
 ```
 
+## Deployment Architecture
+
+The production deployment uses a **single-container, single-process** model:
+
+```
+┌─────────────────────────────────────────────┐
+│  Docker Container (port 8080)               │
+│                                             │
+│  Streamlit (app.py)                         │
+│    ├── Renders chat UI                      │
+│    ├── Calls ReportGenerator directly       │
+│    │   (no HTTP, no FastAPI)                │
+│    └── Pipeline runs in-process             │
+│                                             │
+│  Health check: /_stcore/health              │
+└─────────────────────────────────────────────┘
+```
+
+`app.py` integrates the agent pipeline directly into the Streamlit process, eliminating the need for a separate FastAPI backend. This avoids port conflicts on single-container platforms like Digital Ocean App Platform.
+
+The FastAPI backend (`main.py`) and HTTP-based frontend (`streamlit_app.py`) remain available for local development and headless API access.
+
 ## Pipeline Architecture
 
 The pipeline is a linear LangGraph `StateGraph` with 5 nodes. Each node receives the full `PipelineState` and returns a partial state update dict.
@@ -66,14 +89,15 @@ The pipeline is a linear LangGraph `StateGraph` with 5 nodes. Each node receives
            ▼
 ┌──────────────────────┐
 │ 2. generate_queries  │ ──►    OpenAI GPT (temp=0.4, JSON mode)
-│                      │        Generates 8-10 targeted Google queries
+│                      │        Generates exactly 5 targeted queries
 │                      │        informed by SIC codes, status, insolvency
 └──────────┬───────────┘
-           │ search_queries: list[str]
+           │ search_queries: list[str] (max 5)
            ▼
 ┌──────────────────────┐
-│ 3. execute_searches  │ ──►    SerpAPI Google Search (per query, num=5)
-│                      │        SerpAPI Google News (company name)
+│ 3. execute_searches  │ ──►    SerpAPI Google Search + News
+│    (parallel)        │        5 web queries + 1 news query
+│                      │        ALL executed concurrently via asyncio.gather
 │                      │        Returns snippets, Knowledge Graph, news
 └──────────┬───────────┘
            │ search_results: list[dict]
@@ -93,6 +117,14 @@ The pipeline is a linear LangGraph `StateGraph` with 5 nodes. Each node receives
 └──────────────────────┘
 ```
 
+### Latency Optimisations
+
+| Optimisation | Impact |
+|---|---|
+| **Parallel SerpAPI execution** — all 6 queries (5 web + 1 news) run concurrently via `asyncio.gather` | ~30-35s saved vs sequential |
+| **Reduced query count** — LLM generates 5 focused queries (hard-capped) instead of 8-10 | ~10-15s saved on search + summarisation |
+| **Single-process deployment** — `app.py` calls pipeline directly, no HTTP round-trip to FastAPI | ~1-2s saved per request |
+
 ## State Schema
 
 ```python
@@ -101,7 +133,7 @@ class PipelineState(TypedDict):
     company_name: str                            # Input
     company_profile_text: str                    # Node 1: formatted CH profile
     company_metadata: dict                       # Node 1: structured metadata
-    search_queries: list[str]                    # Node 2: LLM-generated queries
+    search_queries: list[str]                    # Node 2: LLM-generated queries (max 5)
     search_results: list[dict]                   # Node 3: normalised SerpAPI results
     search_summary: str                          # Node 4: LLM briefing with citations
     final_report: dict                           # Node 5: serialised UnderwritingReport
@@ -164,7 +196,9 @@ Before the pipeline runs, `EntityResolver` handles company identification:
    - Multiple active but only one exact name match → auto-resolve
    - Otherwise → return disambiguation response with candidate list
 
-## API Endpoints
+## API Endpoints (FastAPI)
+
+Available when running `main.py`. Not used by the standalone `app.py` deployment.
 
 | Method | Path | Description |
 |---|---|---|
@@ -175,27 +209,36 @@ Before the pipeline runs, `EntityResolver` handles company identification:
 
 ## Frontend
 
-`streamlit_app.py` provides a chat-based interface that:
+Two Streamlit entrypoints are available:
 
-- Calls the FastAPI backend over HTTP
-- Validates all responses with Pydantic models (client-side mirrors of `schemas/report.py`)
-- Renders reports with structured sections, signal strength badges, source links
-- Handles disambiguation with selectable company cards
-- Shows system health in the sidebar
+| File | Mode | Backend |
+|---|---|---|
+| `app.py` | Standalone (production) | Calls `ReportGenerator` directly in-process |
+| `streamlit_app.py` | Client-server (dev) | Calls FastAPI backend via HTTP |
+
+Both provide the same chat-based UI with report rendering, disambiguation handling, and sidebar quick examples.
 
 ## Key Design Decisions
 
+### Single-container deployment
+
+`app.py` integrates the pipeline directly into the Streamlit process. This eliminates the FastAPI HTTP hop and resolves health check failures on single-port platforms (Digital Ocean, Railway, Render). The tradeoff is tighter coupling between UI and pipeline code.
+
+### Parallel search execution
+
+All SerpAPI queries (5 web + 1 news) execute concurrently via `asyncio.gather`. Each query runs in a separate thread (`asyncio.to_thread`) since the SerpAPI client is synchronous. Failures in individual queries are caught and logged without blocking others.
+
+### 5 focused queries instead of 8-10
+
+The LLM generates exactly 5 queries (hard-capped with `[:5]`), each targeting a distinct area: business model, competitors, reviews, news, and sectoral outlook. This reduces SerpAPI cost and latency while maintaining coverage across all report sections.
+
 ### LangGraph over custom agent loop
 
-The explicit `StateGraph` provides a typed state contract (`PipelineState`), per-node inspectable I/O, automatic error accumulation via `Annotated[list[str], operator.add]`, and trivial extensibility (add a node + an edge). The tradeoff is an additional dependency tree.
-
-### LLM-generated search queries
-
-The LLM sees Companies House context (SIC codes, incorporation date, status, insolvency flag) and generates queries specific to the company. A fintech company gets queries about banking licences and FCA regulation, not generic "UK company overview". One additional LLM call (~$0.01) for significantly better search relevance.
+The explicit `StateGraph` provides a typed state contract (`PipelineState`), per-node inspectable I/O, automatic error accumulation via `Annotated[list[str], operator.add]`, and trivial extensibility (add a node + an edge).
 
 ### Separate summariser node
 
-Raw results from 8-10 queries can exceed 30,000 tokens. The summariser distils them into a ~3,000 token briefing with enforced `[Source: URL]` citations, keeping the synthesis prompt focused and debuggable.
+Raw search results from 5 queries can exceed 15,000 tokens. The summariser distils them into a ~3,000 token briefing with enforced `[Source: URL]` citations, keeping the synthesis prompt focused and debuggable.
 
 ### No fallbacks
 
@@ -219,11 +262,11 @@ Each quality signal carries a `strength` field (strong/moderate/weak) based on s
 
 ## Future Improvements
 
-1. **Parallel search execution** — `asyncio.gather` over SerpAPI queries instead of sequential
-2. **Caching** — Redis cache for CH profiles (24h TTL) and search results (1h TTL)
-3. **Conditional graph edges** — Insolvency flag triggers a dedicated risk deep-dive node
-4. **FCA register integration** — Automated FCA authorisation check for financial services companies
-5. **Streaming responses** — SSE for progressive report rendering
-6. **API authentication** — OAuth2 or API key auth on endpoints
+1. **Caching** — Redis or in-memory cache for CH profiles (24h TTL) and search results (1h TTL)
+2. **Conditional graph edges** — Insolvency flag triggers a dedicated risk deep-dive node
+3. **FCA register integration** — Automated FCA authorisation check for financial services companies
+4. **Streaming responses** — Progressive report rendering as each node completes
+5. **Merge summarise + synthesise** — Single LLM call to further reduce latency
+6. **API authentication** — OAuth2 or API key auth on FastAPI endpoints
 7. **Rate limiting** — Per-user SerpAPI quota protection
 8. **Report persistence** — PostgreSQL storage with version comparison over time

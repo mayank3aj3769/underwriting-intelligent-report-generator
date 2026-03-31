@@ -10,8 +10,8 @@ Given a UK company identifier, the system:
 
 1. Resolves the company via Companies House (with disambiguation when names are ambiguous)
 2. Fetches the official filing data — profile, officers, SIC codes, charges, insolvency history
-3. Uses an LLM to generate targeted search queries based on the company's context
-4. Executes those queries via SerpAPI (Google Search + Google News)
+3. Uses an LLM to generate 5 targeted search queries based on the company's context
+4. Executes all queries in parallel via SerpAPI (Google Search + Google News)
 5. Summarises all search results into a structured, citation-backed intelligence briefing
 6. Synthesises the final report combining Companies House data and the research briefing
 
