@@ -1,7 +1,10 @@
 """LangGraph node functions for the underwriting intelligence pipeline.
 
 Pipeline:  fetch_companies_house → generate_queries → execute_searches
-             → summarize_searches → synthesize_report
+             → summarize_searches → evaluate_sufficiency
+             → (if insufficient) generate_gap_queries → execute_searches
+               → summarize_searches → evaluate_sufficiency
+             → synthesize_report
 
 Every node receives PipelineState and returns a partial state update dict.
 """
@@ -20,6 +23,8 @@ from tools.search_api import SerpAPIClient
 
 logger = logging.getLogger(__name__)
 
+MAX_SUFFICIENCY_ITERATIONS = 2
+
 
 # =====================================================================
 # Node 1: Fetch Companies House data
@@ -30,7 +35,6 @@ async def fetch_companies_house(state: PipelineState) -> dict:
     ch = CompaniesHouseTool()
     errors: list[str] = []
     company_number = state["company_number"]
-    company_name = state["company_name"]
 
     profile = await ch.get_company_profile(company_number)
     officers = await ch.get_officers(company_number)
@@ -116,14 +120,19 @@ async def generate_queries(state: PipelineState) -> dict:
         f"  Incorporated: {meta.get('date_of_creation', 'unknown')}\n"
         f"  SIC activities: {', '.join(sic_labels) if sic_labels else 'not listed'}\n"
         f"  Insolvency history: {meta.get('has_insolvency_history', 'unknown')}\n\n"
-        "Generate exactly 5 targeted Google search queries that will surface:\n"
+        "Generate exactly 6 targeted Google search queries that will surface:\n"
         "1. Business model, products/services, and revenue model\n"
-        "2. Key competitors and market position\n"
-        "3. Customer reviews and reputation (Trustpilot, G2, press)\n"
-        "4. Recent news, funding, or regulatory actions\n"
-        "5. Industry outlook and sectoral trends\n\n"
-        "Return a JSON object: {\"queries\": [\"query1\", ..., \"query5\"]}\n"
-        "Each query should be specific, phrased for Google, and maximise coverage across these 5 areas."
+        "2. Revenue figures: current revenue, annual turnover, financial results, "
+        "revenue growth — use terms like 'revenue', 'turnover', 'financial results', "
+        "'annual report' in the query\n"
+        "3. Key competitors and market position\n"
+        "4. Customer reviews and reputation (Trustpilot, G2, press)\n"
+        "5. Recent news, funding, or regulatory actions\n"
+        "6. Industry outlook and sectoral trends\n\n"
+        "Return a JSON object: {\"queries\": [\"query1\", ..., \"query6\"]}\n"
+        "IMPORTANT: Query #2 MUST specifically target financial/revenue data. "
+        "Example: '\"COMPANY NAME\" revenue turnover financial results 2024 2025'.\n"
+        "Each query should be specific, phrased for Google, and maximise coverage across these 6 areas."
     )
 
     try:
@@ -143,7 +152,7 @@ async def generate_queries(state: PipelineState) -> dict:
             response_format={"type": "json_object"},
         )
         data = json.loads(resp.choices[0].message.content or "{}")
-        queries: list[str] = data.get("queries", [])[:5]
+        queries: list[str] = data.get("queries", [])[:6]
     except Exception as e:
         errors.append(f"LLM query generation failed: {e}")
         queries = []
@@ -157,14 +166,17 @@ async def generate_queries(state: PipelineState) -> dict:
 # =====================================================================
 
 async def execute_searches(state: PipelineState) -> dict:
-    """Run all LLM-generated queries through SerpAPI in parallel."""
+    """Run all LLM-generated queries through SerpAPI in parallel.
+
+    On iteration > 0, merges new results with existing ones (deduped by URL).
+    """
     import asyncio
 
     client = SerpAPIClient()
-    all_results: list[dict] = []
     errors: list[str] = []
     queries = state.get("search_queries", [])
     company_name = state["company_name"]
+    iteration = state.get("iteration_count", 0)
 
     async def _web_search(query: str) -> tuple[str, list[dict] | Exception]:
         try:
@@ -185,19 +197,33 @@ async def execute_searches(state: PipelineState) -> dict:
         except Exception as e:
             return q, e
 
-    tasks = [_web_search(q) for q in queries] + [_news_search()]
+    tasks = [_web_search(q) for q in queries]
+    if iteration == 0:
+        tasks.append(_news_search())
+
     results = await asyncio.gather(*tasks)
 
+    new_results: list[dict] = []
     for query, outcome in results:
         if isinstance(outcome, Exception):
             errors.append(f"SerpAPI search failed for '{query}': {outcome}")
             logger.warning("SerpAPI failed for '%s': %s", query, outcome)
         else:
-            all_results.extend(outcome)
+            new_results.extend(outcome)
             logger.info("SerpAPI: '%s' -> %d results", query, len(outcome))
 
-    logger.info("Total search results collected: %d (from %d parallel queries)", len(all_results), len(tasks))
-    return {"search_results": all_results, "errors": errors}
+    existing_results = state.get("search_results", []) if iteration > 0 else []
+    seen_urls = {r.get("url") for r in existing_results if r.get("url")}
+    for r in new_results:
+        if r.get("url") not in seen_urls:
+            existing_results.append(r)
+            seen_urls.add(r.get("url"))
+
+    logger.info(
+        "Search iteration %d: %d new results, %d total (from %d queries)",
+        iteration, len(new_results), len(existing_results), len(tasks),
+    )
+    return {"search_results": existing_results, "errors": errors}
 
 
 # =====================================================================
@@ -219,13 +245,19 @@ async def summarize_searches(state: PipelineState) -> dict:
         f"Synthesise them into a structured briefing.\n\n"
         f"SEARCH RESULTS:\n{results_block}\n\n"
         "Produce a briefing with these sections:\n\n"
-        "1. BUSINESS MODEL\n"
+        "1. BUSINESS MODEL & REVENUE\n"
         "   a) What does this company actually do? Describe its core operations.\n"
         "   b) How does it make money? Be specific about revenue streams "
         "(subscriptions, fees, commissions, licensing, etc.).\n"
-        "   c) Who are its customers? Identify segments (consumers, SMBs, "
+        "   c) CURRENT REVENUE: What is the most recent publicly available "
+        "revenue or turnover figure? Include the year/period and currency. "
+        "If the company is private and revenue is not publicly disclosed, "
+        "state that explicitly.\n"
+        "   d) REVENUE TREND: Is revenue growing or declining? By how much? "
+        "Over what period? If trend data is not available, state that explicitly.\n"
+        "   e) Who are its customers? Identify segments (consumers, SMBs, "
         "enterprise, governments, etc.) and geographies.\n"
-        "   d) What are its key products/services?\n\n"
+        "   f) What are its key products/services?\n\n"
         "2. COMPETITIVE LANDSCAPE\n"
         "   a) Name specific competitors and explain WHY each is relevant.\n"
         "   b) Assess the DEGREE of competition (low/medium/high) with "
@@ -290,7 +322,224 @@ async def summarize_searches(state: PipelineState) -> dict:
 
 
 # =====================================================================
-# Node 5: Final report synthesis
+# Node 5: Evaluate evidence sufficiency
+# =====================================================================
+
+async def evaluate_sufficiency(state: PipelineState) -> dict:
+    """Analyse collected evidence and decide whether it is sufficient.
+
+    Checks:
+      - Total source count
+      - Coverage across key sections (business, competition, quality, news)
+      - Presence of competitor mentions
+      - Presence of review / news content
+    Returns evidence_metrics, updated iteration_count, and sufficiency_flag.
+    """
+    results = state.get("search_results", [])
+    summary = state.get("search_summary", "")
+    iteration = state.get("iteration_count", 0)
+    summary_lower = summary.lower()
+
+    total_sources = len(results)
+
+    result_types = {r.get("type", "web") for r in results}
+    result_snippets = " ".join(
+        (r.get("snippet", "") + " " + r.get("title", "")).lower()
+        for r in results
+    )
+
+    has_business_info = any(
+        kw in result_snippets
+        for kw in ("business model", "product", "service", "customer")
+    )
+    has_revenue_data = any(
+        kw in result_snippets
+        for kw in (
+            "revenue", "turnover", "annual report", "financial results",
+            "profit", "£", "$", "million", "billion", "mn", "bn",
+        )
+    )
+    has_competitors = any(
+        kw in result_snippets or kw in summary_lower
+        for kw in ("competitor", "competes with", "rival", "market share", "vs ")
+    )
+    has_reviews = any(
+        kw in result_snippets
+        for kw in ("trustpilot", "review", "rating", "g2.com", "glassdoor")
+    )
+    has_news = "news" in result_types or any(
+        kw in result_snippets for kw in ("news", "announced", "funding", "raised")
+    )
+    has_financial_signals = any(
+        kw in result_snippets
+        for kw in ("fca", "insolvency", "charge", "regulatory", "fine", "compliance")
+    )
+
+    section_coverage = {
+        "business_model": has_business_info,
+        "revenue": has_revenue_data,
+        "competition": has_competitors,
+        "quality_signals": has_reviews,
+        "news": has_news,
+        "financial_regulatory": has_financial_signals,
+    }
+
+    covered_count = sum(1 for v in section_coverage.values() if v)
+    total_sections = len(section_coverage)
+
+    source_score = min(total_sources / 20.0, 1.0) * 0.3
+    coverage_score = (covered_count / total_sections) * 0.5
+    summary_score = min(len(summary) / 3000.0, 1.0) * 0.2
+    confidence_score = round(source_score + coverage_score + summary_score, 2)
+
+    missing_sections: list[str] = [
+        section for section, covered in section_coverage.items() if not covered
+    ]
+
+    is_sufficient = (
+        confidence_score >= 0.6
+        and total_sources >= 8
+        and covered_count >= 3
+    )
+
+    if iteration >= MAX_SUFFICIENCY_ITERATIONS:
+        reasoning = (
+            f"Max iterations ({MAX_SUFFICIENCY_ITERATIONS}) reached. "
+            f"Proceeding with available evidence "
+            f"(confidence={confidence_score}, sources={total_sources}, "
+            f"covered={covered_count}/{total_sections})."
+        )
+        is_sufficient = True
+        logger.info("Sufficiency: max iterations reached, forcing proceed. %s", reasoning)
+    elif is_sufficient:
+        reasoning = (
+            f"Evidence sufficient at iteration {iteration}: "
+            f"confidence={confidence_score}, sources={total_sources}, "
+            f"covered={covered_count}/{total_sections}."
+        )
+        logger.info("Sufficiency: PASS. %s", reasoning)
+    else:
+        reasoning = (
+            f"Evidence insufficient at iteration {iteration}: "
+            f"confidence={confidence_score}, sources={total_sources}, "
+            f"covered={covered_count}/{total_sections}. "
+            f"Missing: {', '.join(missing_sections)}."
+        )
+        logger.info("Sufficiency: FAIL — triggering additional data gathering. %s", reasoning)
+
+    metrics = {
+        "total_sources": total_sources,
+        "has_business_info": has_business_info,
+        "has_revenue_data": has_revenue_data,
+        "has_competitors": has_competitors,
+        "has_reviews": has_reviews,
+        "has_news": has_news,
+        "has_financial_signals": has_financial_signals,
+        "section_coverage": section_coverage,
+        "confidence_score": confidence_score,
+        "missing_sections": missing_sections,
+        "is_sufficient": is_sufficient,
+        "reasoning": reasoning,
+    }
+
+    return {
+        "evidence_metrics": metrics,
+        "iteration_count": iteration + 1,
+        "sufficiency_flag": is_sufficient,
+    }
+
+
+# =====================================================================
+# Node 6: Generate gap-filling queries for missing sections
+# =====================================================================
+
+_GAP_QUERY_TEMPLATES: dict[str, str] = {
+    "business_model": '"{name}" business model products services',
+    "revenue": '"{name}" revenue turnover financial results annual report',
+    "competition": '"{name}" competitors market share industry rivals',
+    "quality_signals": '"{name}" Trustpilot reviews customer ratings reputation',
+    "news": '"{name}" latest news announcements funding',
+    "financial_regulatory": '"{name}" FCA regulation compliance financial conduct',
+}
+
+
+async def generate_gap_queries(state: PipelineState) -> dict:
+    """Generate targeted queries that fill gaps identified by evaluate_sufficiency."""
+    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    errors: list[str] = []
+
+    metrics = state.get("evidence_metrics", {})
+    missing = metrics.get("missing_sections", [])
+    name = state["company_name"]
+    meta = state.get("company_metadata", {})
+    sic_codes = meta.get("sic_codes", [])
+    sic_labels = [SIC_DESCRIPTIONS.get(c, c) for c in sic_codes]
+
+    if not missing:
+        logger.info("No gaps to fill — no additional queries generated")
+        return {"search_queries": [], "errors": errors}
+
+    gap_descriptions = {
+        "business_model": "business model, products/services, and how the company operates",
+        "revenue": "current revenue, annual turnover, financial results, and revenue growth trend",
+        "competition": "competitors, market position, and competitive landscape",
+        "quality_signals": "customer reviews (Trustpilot, G2), reputation signals, and ratings",
+        "news": "recent news, funding rounds, partnerships, or regulatory actions",
+        "financial_regulatory": "FCA status, regulatory compliance, financial conduct issues",
+    }
+
+    gap_list = "\n".join(
+        f"- {gap_descriptions.get(s, s)}" for s in missing
+    )
+
+    prompt = (
+        f"You are a research analyst investigating **{name}** "
+        f"(Companies House #{state['company_number']}).\n\n"
+        f"SIC activities: {', '.join(sic_labels) if sic_labels else 'not listed'}\n\n"
+        f"Previous research found INSUFFICIENT evidence in these areas:\n{gap_list}\n\n"
+        f"Generate {min(len(missing) * 2, 5)} highly targeted Google search queries "
+        f"that will SPECIFICALLY fill these gaps. Focus ONLY on the missing areas.\n\n"
+        "Return a JSON object: {\"queries\": [\"query1\", ...]}\n"
+        "Each query should be specific, phrased for Google, and designed to find "
+        "the exact type of information that is missing."
+    )
+
+    try:
+        resp = await client.chat.completions.create(
+            model=settings.OPENAI_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You generate targeted gap-filling search queries for business "
+                        "intelligence research. Return only valid JSON."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.4,
+            response_format={"type": "json_object"},
+        )
+        data = json.loads(resp.choices[0].message.content or "{}")
+        queries: list[str] = data.get("queries", [])[:5]
+    except Exception as e:
+        logger.warning("LLM gap query generation failed, using templates: %s", e)
+        errors.append(f"LLM gap query generation failed (using templates): {e}")
+        queries = [
+            _GAP_QUERY_TEMPLATES[s].format(name=name)
+            for s in missing
+            if s in _GAP_QUERY_TEMPLATES
+        ][:5]
+
+    logger.info(
+        "Generated %d gap-filling queries for missing sections: %s",
+        len(queries), missing,
+    )
+    return {"search_queries": queries, "errors": errors}
+
+
+# =====================================================================
+# Node 7: Final report synthesis
 # =====================================================================
 
 async def synthesize_report(state: PipelineState) -> dict:
@@ -316,6 +565,15 @@ async def synthesize_report(state: PipelineState) -> dict:
         'actually does — grounded in evidence, not generic",\n'
         '    "revenue_model": "how it generates revenue — be specific '
         '(subscriptions, fees, commissions, etc.)",\n'
+        '    "current_revenue": "most recent publicly available revenue/turnover '
+        'figure with year and currency (e.g. \'£1.1bn revenue in FY2024\'). '
+        'If the company is private and revenue is not publicly disclosed, '
+        'state: \'Revenue figures are not publicly available — [company] is '
+        'a private company that does not disclose financial results.\'",\n'
+        '    "revenue_trend": "revenue growth or decline trajectory with '
+        'specific numbers and time period (e.g. \'Revenue grew 35% YoY from '
+        '£800m in 2023 to £1.1bn in 2024\'). If trend data is not available, '
+        'state that explicitly and explain why.",\n'
         '    "key_products_services": ["product1", "product2"],\n'
         '    "customer_segments": ["who buys from them — be specific"],\n'
         '    "geographies": ["key markets/regions served"],\n'
@@ -411,6 +669,17 @@ async def synthesize_report(state: PipelineState) -> dict:
 
 
 # =====================================================================
+# Routing function for conditional edge
+# =====================================================================
+
+def sufficiency_router(state: PipelineState) -> str:
+    """Decide whether to loop for more evidence or proceed to synthesis."""
+    if state.get("sufficiency_flag", False):
+        return "synthesize_report"
+    return "generate_gap_queries"
+
+
+# =====================================================================
 # Helpers
 # =====================================================================
 
@@ -497,6 +766,8 @@ def _build_report(
         ConfidenceLevel.MEDIUM if evidence_count > 5 else ConfidenceLevel.LOW
     )
 
+    metrics = state.get("evidence_metrics", {})
+
     report = UnderwritingReport(
         company_name=state["company_name"],
         company_number=state["company_number"],
@@ -505,6 +776,8 @@ def _build_report(
         business_model=BusinessModelSummary(
             description=bm.get("description", "Unable to determine"),
             revenue_model=bm.get("revenue_model"),
+            current_revenue=bm.get("current_revenue"),
+            revenue_trend=bm.get("revenue_trend"),
             key_products_services=bm.get("key_products_services", []),
             customer_segments=bm.get("customer_segments", []),
             geographies=bm.get("geographies", []),
@@ -549,6 +822,9 @@ def _build_report(
         business_outlook=analysis.get("business_outlook"),
         sectoral_outlook=analysis.get("sectoral_outlook"),
         raw_evidence_count=evidence_count,
+        evidence_confidence_score=metrics.get("confidence_score", 0.0),
+        evidence_iterations=state.get("iteration_count", 1),
+        evidence_gaps_found=metrics.get("missing_sections", []),
     )
 
     report.readable_report = generate_readable_report(report)
