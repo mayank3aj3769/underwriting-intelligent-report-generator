@@ -2,7 +2,7 @@
 
 Automated underwriting intelligence reports for UK companies. Accepts a company name or Companies House registration number, gathers evidence from structured APIs, and produces a grounded, citation-backed report.
 
-**Stack:** Python 3.11 | FastAPI | LangGraph | OpenAI GPT | SerpAPI | Companies House API | Streamlit
+**Stack:** Python 3.11 | Streamlit | LangGraph | OpenAI GPT | SerpAPI | Companies House API
 
 ## What It Does
 
@@ -25,7 +25,16 @@ The report includes:
 
 Every claim references the source it came from. The system surfaces uncertainty rather than papering over it.
 
-## Quick Start
+## Entrypoints
+
+| Entrypoint | What it runs | Use case |
+|---|---|---|
+| `app.py` | **Streamlit (standalone)** — calls pipeline directly, no backend needed | Production deployment, Digital Ocean |
+| `streamlit_app.py` | Streamlit frontend that calls FastAPI backend via HTTP | Local dev with separate API |
+| `main.py` | FastAPI REST API | Headless API access, curl/Postman |
+| `cli.py` | CLI report generator | Quick local testing |
+
+## Quick Start (Local)
 
 ### Prerequisites
 
@@ -69,7 +78,15 @@ OPENAI_API_KEY=your_openai_key
 
 Set `COMPANIES_HOUSE_API_URL` to `https://api-sandbox.company-information.service.gov.uk` for sandbox testing.
 
-### 3. Run the API server
+### 3. Run the standalone Streamlit app
+
+```bash
+streamlit run app.py --server.port 8080
+```
+
+Open http://localhost:8080 for the chat interface. No separate backend required.
+
+### 4. Run the FastAPI backend (alternative)
 
 ```bash
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
@@ -78,82 +95,67 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 - API: http://localhost:8000
 - Swagger docs: http://localhost:8000/docs
 
-### 4. Run the Streamlit frontend (optional)
-
-In a separate terminal:
+Then in a separate terminal:
 
 ```bash
-streamlit run streamlit_app.py --server.port 8501 --server.headless true
+streamlit run streamlit_app.py --server.port 8501
 ```
 
-Open http://localhost:8501 for the chat-based interface.
-
-### 5. Run via CLI (optional)
+### 5. Run via CLI
 
 ```bash
-# By company number
 python cli.py 08804411
-
-# By name (handles disambiguation)
 python cli.py "REVOLUT LTD"
-
-# Ambiguous name — shows candidates
 python cli.py "Barclays"
 ```
 
-## Docker Deployment
+## Deployment (Digital Ocean App Platform)
 
-### Build
+The app is designed for single-container deployment. The Dockerfile runs `app.py` (standalone Streamlit) on port **8080** with the agent pipeline integrated directly — no separate backend service.
+
+### Build and run locally
 
 ```bash
 docker build -t underwriting-intel .
+docker run -p 8080:8080 --env-file .env underwriting-intel
 ```
 
-### Run the API server
+Open http://localhost:8080
 
-```bash
-docker run -p 8000:8000 --env-file .env underwriting-intel
+### Deploy to Digital Ocean
+
+1. Push your repo to GitHub.
+
+2. In Digital Ocean App Platform, create a new app from your repo.
+
+3. Set the **HTTP port** to `8080` in the app settings.
+
+4. Add environment variables in the Digital Ocean dashboard:
+
+```
+COMPANIES_HOUSE_API_KEY=your_key
+COMPANIES_HOUSE_API_URL=https://api.company-information.service.gov.uk
+SERP_API_KEY=your_key
+OPENAI_API_KEY=your_key
 ```
 
-### Run the Streamlit frontend
+5. The health check will automatically hit `http://localhost:8080/_stcore/health` (Streamlit's built-in health endpoint).
 
-```bash
-docker run -p 8501:8501 --env-file .env underwriting-intel \
-  streamlit run streamlit_app.py --server.port 8501 --server.headless true
-```
+6. Deploy. The container starts Streamlit on port 8080, which is the same port Digital Ocean health checks will probe.
 
-### Docker Compose (both services)
+### Why a single service?
 
-```yaml
-version: "3.9"
-services:
-  api:
-    build: .
-    ports:
-      - "8000:8000"
-    env_file: .env
+The previous architecture ran FastAPI (port 8000) + Streamlit (port 8501) as two processes. This caused health check failures on platforms that expect a single port. `app.py` eliminates the HTTP hop by calling `ReportGenerator` directly from the Streamlit process.
 
-  frontend:
-    build: .
-    command: streamlit run streamlit_app.py --server.port 8501 --server.headless true
-    ports:
-      - "8501:8501"
-    env_file: .env
-    depends_on:
-      - api
-    environment:
-      - API_BASE=http://api:8000
-```
+## API Reference (FastAPI backend)
 
-## API Reference
+These endpoints are available when running `main.py` (not used by `app.py`).
 
 ### `GET /health`
 
 Returns system status and API key configuration.
 
 ### `POST /api/v1/search`
-
-Search Companies House by name.
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/search \
@@ -163,8 +165,6 @@ curl -X POST http://localhost:8000/api/v1/search \
 
 ### `POST /api/v1/report`
 
-Generate a report by company name or number. Returns disambiguation response if the name is ambiguous.
-
 ```bash
 curl -X POST http://localhost:8000/api/v1/report \
   -H "Content-Type: application/json" \
@@ -173,24 +173,10 @@ curl -X POST http://localhost:8000/api/v1/report \
 
 ### `POST /api/v1/report/by-number`
 
-Generate a report directly from a Companies House number (no disambiguation).
-
 ```bash
 curl -X POST http://localhost:8000/api/v1/report/by-number \
   -H "Content-Type: application/json" \
   -d '{"company_number": "08804411"}'
-```
-
-**PowerShell equivalents:**
-
-```powershell
-# Search
-Invoke-RestMethod -Method Post -Uri http://localhost:8000/api/v1/search `
-  -ContentType "application/json" -Body '{"query": "Barclays"}'
-
-# Report by number
-Invoke-RestMethod -Method Post -Uri http://localhost:8000/api/v1/report/by-number `
-  -ContentType "application/json" -Body '{"company_number": "08804411"}'
 ```
 
 ## Running Tests
@@ -199,17 +185,7 @@ Invoke-RestMethod -Method Post -Uri http://localhost:8000/api/v1/report/by-numbe
 python -m tests.test_e2e
 ```
 
-Results are written to `tests/test_results.txt`. The test suite covers:
-
-| Test | What it verifies |
-|---|---|
-| Health Check | All API keys configured |
-| Search Disambiguation | Ambiguous names return multiple candidates |
-| Ambiguous Name → Disambiguation | Report endpoint returns disambiguation response |
-| Full Pipeline (by number) | Complete report generation with evidence |
-| Exact Name Auto-Resolve | Exact company names skip disambiguation |
-| Unknown Company Number | Clear error for non-existent companies |
-| Empty Input | Empty input rejected |
+Results are written to `tests/test_results.txt`.
 
 ## Configuration Reference
 
